@@ -1,0 +1,24 @@
+splittar (0.2) unstable; urgency=low
+
+  * Fixed permission denied warning on broken symlinks
+  * Added better logging facilities (-d, -v, -q options)
+  * Keep more than one tar file open so splittar can generate files
+    with more consistent sizes
+  * Added --version option to print out splittar's version
+  * Improved documentation
+  * Try to keep average file size to the specified maximum (this only applies
+    when some of the files have become too large)
+  * Close files that are too large so we can flush their buffers and get a
+    better idea of just how big they really are
+  * Added ability to change how much the past compression ratio affects the
+    estimated size of a file (ratio weight parameter)
+  * Fixed invalid size string handling
+  * Small optimizations
+
+ -- Chris AtLee <chris@atlee.ca>  Wed, 15 Feb 2006 17:12:25 -0500
+
+splittar (0.1) unstable; urgency=low
+
+  * Initial release.
+
+ -- Chris AtLee <chris@atlee.ca>  Wed, 25 Jan 2006 15:09:35 -0500

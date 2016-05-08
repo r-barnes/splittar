@@ -1,0 +1,20 @@
+Source: splittar
+Section: utils
+Priority: optional
+Maintainer: Chris AtLee <chris@atlee.ca>
+Build-Depends-Indep: debhelper (>= 4.0.0), cdbs, python-dev, docbook-to-man
+Standards-Version: 3.6.2
+
+Package: splittar
+Architecture: all
+Depends: ${python:Depends}
+Description: Create multiple tar files with a certain maximum size
+ splittar allows you to create one or more tar files from a set of data where
+ each of the generated tar files is less than a specified maximum size.
+ .
+ Each tar file is a proper, self-contained tar file.  Other methods of
+ backing up data to removable media requires a tar file to be split, making
+ tar file n useless without files 1,...,n-1.
+ .
+ splittar was written to backup large amounts of data that spanned multiple
+ DVDs while allowing for each DVD to be useful on its own.

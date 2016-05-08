@@ -1,0 +1,16 @@
+#!/usr/bin/make -f
+
+include /usr/share/cdbs/1/rules/debhelper.mk
+
+STAGING_DIR := $(CURDIR)/debian/splittar
+
+splittar.1: splittar.1.sgml
+	docbook-to-man $^ > $@
+
+install/splittar:: splittar.1
+	mkdir -pm755 $(STAGING_DIR)/usr/bin
+	install -m755 splittar $(STAGING_DIR)/usr/bin/splittar
+	dh_python
+
+cleanbuilddir/splittar::
+	rm -rf $(STAGING_DIR) $(wildcard *.pyc *.pyo)

@@ -1,0 +1,379 @@
+#!/usr/bin/python2.4
+# Written by Chris AtLee <chris@atlee.ca>
+# Released under the GPL v2
+"""splittar [options] -f <outputfile> files
+
+splittar creates one or more tar archive files from the specified input files.
+Each generated tar file will be limited in size to a user-defined amount.
+
+See 'man splittar' for more information"""
+
+revision="$Rev: 29 $"
+version="0.2"
+rstr = "r" + revision[5:-1].strip()
+
+import tarfile
+import sys
+import os, os.path
+from optparse import OptionParser, Option, OptionError, OptionValueError
+import logging
+import operator
+import time
+
+class SizeOption(Option):
+    TYPES = Option.TYPES + ("size",)
+    TYPE_CHECKER = Option.TYPE_CHECKER.copy()
+    _sizeSuffixes = dict(
+            KB = 1024,
+            MB = 1024 ** 2,
+            GB = 1024 ** 3,
+            TB = 1024 ** 4)
+    _sizeUnits = dict(
+            DVD = 4699979766,
+            DVD3 = 1566572544,
+            CD = 700 * 1024 * 1024,
+            CD650 = 650 * 1024 * 1024,
+            )
+
+    @classmethod
+    def check_size(cls, option, opt, value):
+        # Maybe it's just a number...
+        try:
+            return int(value)
+        except ValueError:
+            pass
+
+        # Check if it's one of the defined size units
+        if value in cls._sizeUnits:
+            return cls._sizeUnits[value]
+
+        # Check its suffix
+        for suffix, multiplier in cls._sizeSuffixes.items():
+            if value.endswith(suffix):
+                # Take off the suffix, and try to interpret the rest as
+                # an integer
+                try:
+                    size = int(value.replace(suffix, "")) * multiplier
+                    return size
+                except ValueError:
+                    raise OptionValueError(
+                            "option %s: invalid size string: %r" % (opt, value))
+
+        # We don't know what to do!
+        raise OptionValueError(
+                "option %s: invalid size string: %r" % (opt, value))
+
+SizeOption.TYPE_CHECKER["size"] = SizeOption.check_size
+
+class TarFile:
+    def __init__(self, fn, mode):
+        self.fp = tarfile.open(fn, mode)
+        self.fn = fn
+        self.size = 0
+        self.closed = False
+        self.inputSize = 0
+
+        self.startTime = time.time()
+
+    def add(self, p):
+        self.fp.add(p, recursive=False)
+        self.size = os.path.getsize(self.fn)
+        if not os.path.islink(p):
+            self.inputSize += os.path.getsize(p)
+        #now = time.time()
+        #ibps = self.inputSize / float(now-self.startTime)
+        #obps = self.size / float(now-self.startTime)
+        #logging.debug("(input: %.2f, output: %.2f) %s in %s", ibps, obps, p, self)
+        # Add 2 blocks, and then round up to the nearest recordsize
+        # This doesn't take into account how well this data compresses
+        # But it also doesn't take into account unwritten data in the
+        # compression buffers
+        # Hopefully the two cancel out :P
+        self.size += 2 * tarfile.BLOCKSIZE
+        self.size += tarfile.RECORDSIZE - (self.size % tarfile.RECORDSIZE)
+
+    def close(self):
+        if not self.closed:
+            logging.info("Closing %s", self)
+            self.fp.close()
+            self.size = os.path.getsize(self.fn)
+            self.closed = True
+
+    def __str__(self):
+        return self.fn
+
+    if hasattr(tarfile.TarFile, "snapshot"):
+        def snapshot(self):
+            return self.fp.snapshot(), self.inputSize
+
+        def restore(self, s):
+            state, self.inputSize = s
+            self.fp.restore(state)
+
+class _TarWriter:
+    def __init__(self, fn, maxsize, comp, maxopen):
+        self.fnBase, self.fnExt = os.path.splitext(fn)
+        if self.fnBase.endswith(".tar"):
+            self.fnExt = ".tar" + self.fnExt
+            self.fnBase = self.fnBase[:-4]
+        self.comp = comp
+        self.maxsize = maxsize
+
+        self.seq = 0
+        self._tarfiles = []
+
+        self._maxopen = maxopen # How many files are we allowed to keep open?
+
+    def bump(self):
+        openFiles = [t for t in self._tarfiles if not t.closed]
+        if self._maxopen > 0 and len(openFiles) >= self._maxopen:
+            # Close the last unclosed tar file
+            openFiles.reverse()
+            for t in openFiles:
+                if not t.closed:
+                    t.close()
+                    break
+
+        fn = self.fnBase + "-%i" % (self.seq+1) + self.fnExt
+        logging.info("Opening %s", fn)
+        self.seq += 1
+
+        if self.comp == "gzip":
+            mode = "w:gz"
+        elif self.comp == "bzip2":
+            mode = "w:bz2"
+        else:
+            mode = "w"
+
+        t = TarFile(fn, mode)
+        self._tarfiles.insert(0,t)
+        return t
+
+    def close(self):
+        for t in self._tarfiles:
+            t.close()
+            if t.size > self.maxsize:
+                logging.warning("Warning: %s is larger than maxsize", t)
+
+class ApproximateLimitTarWriter(_TarWriter):
+    """Record the approximate storage ratio to guess if a given file
+    will fit into the tar file."""
+    def __init__(self, *args, **kw):
+        # How much weight (w) to put on calculated ratio (r)
+        # This affects the file's estimated size (E) in the archive
+        # based on the file's actual size (s)
+        # E = w(r*s) + (1-w)*(s)
+        # w = 1.0 means to completely rely on the compression ratio up until
+        # now to predict a file's compressed size
+        # w = 0.0 means to assume that a file won't compress at all
+        if "ratioWeight" in kw:
+            self.ratioWeight = kw["ratioWeight"]
+            del kw["ratioWeight"]
+        else:
+            self.ratioWeight = 1.0
+
+        _TarWriter.__init__(self, *args, **kw)
+
+        if hasattr(TarFile, "snapshot"):
+            logging.info("Enabling tarfile snapshots")
+            self.doSnapshots = True
+        else:
+            self.doSnapshots = False
+
+    def add(self, p):
+        if len(self._tarfiles) == 0:
+            t = self.bump()
+            t.add(p)
+            if t.size >= self.maxsize:
+                t.close()
+            return
+
+        if os.path.islink(p):
+            sp = 16
+        else:
+            sp = os.path.getsize(p)
+
+        # The goal is the get the average size of the files
+        # equal to maxsize
+        # Calculate our current average size
+        avgSize = reduce(operator.add, (t.size for t in self._tarfiles), 0) / float(len(self._tarfiles))
+        sizecomp = 0
+        # If the average size is above our maximum size, then we
+        # should try to compensate by temporarily reducing the maximum size
+        # Otherwise we just let it be
+        if avgSize > self.maxsize:
+            # Compensate for this!
+            sizecomp = (self.maxsize - avgSize) * len(self._tarfiles)
+            # And do some sanity checking
+            sizecomp = max(-self.maxsize / 2, sizecomp)
+        #logging.debug("avgsize: %i, sizecomp: %i", avgSize, sizecomp)
+
+        tries = 0
+        for t in self._tarfiles:
+            if t.closed:
+                continue
+            tries += 1
+            ti = t.inputSize
+            if ti == 0:
+                # A fresh file!
+                # We can't split large files yet, so just put the file in 
+                # here regardless of how big we think it will be
+                t.add(p)
+                if t.size >= self.maxsize:
+                    # Can't undo, so just close the file
+                    t.close()
+                return
+            else:
+                ratio = t.size / float(ti)
+                estimatedSize = (self.ratioWeight * ratio * sp) + sp * (1.0 - self.ratioWeight)
+                if estimatedSize + t.size < (self.maxsize + sizecomp):
+                    # This file would probably fit
+                    if self.doSnapshots:
+                        s = t.snapshot()
+                        t.add(p)
+                        if t.size >= self.maxsize + sizecomp:
+                            logging.debug("restoring snapshot: %s doesn't fit in %s", p, t)
+                            t.restore(s)
+                            continue
+                        else:
+                            return
+                    else:
+                        t.add(p)
+                        if t.size >= self.maxsize + sizecomp:
+                            t.close()
+                    return
+
+        # Couldn't find a file that would fit
+        logging.debug("Couldn't find a file that would fit (tried %i files)", tries)
+        t = self.bump()
+        t.add(p)
+        if t.size >= self.maxsize:
+            t.close()
+
+def logAccess(p):
+    if os.path.isdir(p) and not os.access(p, os.X_OK):
+        logging.warning("%s: Permission denied", p)
+        return False
+    elif not os.path.islink(p) and not os.access(p, os.R_OK):
+        logging.warning("%s: Permission denied", p)
+        return False
+    return True
+
+def runTar(fn, maxsize, comp, maxopen, ratioWeight, srcs):
+    """
+    Return codes:
+        0: All ok
+        1: Couldn't access some files, but that's ok
+        2: Could not create output file
+        254: Unknown
+        255: Interrupted
+    """
+    retval = 0
+
+    try:
+        T = ApproximateLimitTarWriter(fn, maxsize, comp, maxopen,
+                ratioWeight=ratioWeight)
+        for src in srcs:
+            if os.path.isdir(src) and not os.path.islink(src):
+                if not logAccess(src):
+                    retval = 1
+                for root, dirs, files in os.walk(src):
+                    for d in dirs:
+                        p = os.path.join(root, d)
+                        if not logAccess(p):
+                            retval = 1
+                        else:
+                            T.add(p)
+                    for f in files:
+                        p = os.path.join(root, f)
+                        if not logAccess(p):
+                            retval = 1
+                        else:
+                            T.add(p)
+            else:
+                if not logAccess(src):
+                    retval = 1
+                else:
+                    T.add(src)
+        T.close()
+    except KeyboardInterrupt:
+        retval = 255
+    except IOError,e:
+        if e.errno == 13:
+            sys.stderr.write("splittar: could not create %s\n" % e.filename)
+            retval = 2
+        else:
+            logging.exception("Uncaught exception")
+            retval = 254
+    except:
+        logging.exception("Uncaught exception")
+        retval = 254
+    return retval
+
+if __name__ == "__main__":
+    parser = OptionParser(option_class = SizeOption, usage=__doc__,
+            version="%%prog %(version)s (%(rstr)s)" % globals())
+    parser.add_option("-f", "--output", dest="output", default=None,
+            help="Name of output file")
+    parser.add_option("-m", "--maxsize", type="size", dest="maxsize",
+            default="CD",
+            help="Maximum size of an individual tar file")
+    parser.add_option("-n", "--numopen", type="int", dest="maxopen",
+            default=0,
+            help="Maximum number of tar files to keep open simultaneously")
+    parser.add_option("-r", "--ratioweight", type="float", dest="ratioWeight",
+            default=1.0,
+            help="Ratio weight (default=1.0; assume current file will compress exactly as well as all previous files)")
+    parser.add_option("-x", "--dontapprox", dest="ratioWeight",
+            action="store_const", const=0.0,
+            help="Don't approximate compression ratio (ratio weight=0.0; assume files won't compress)")
+    parser.add_option("-z", "--gzip", dest="comp", default="auto",
+            action="store_const", const="gzip",
+            help="Use gzip compression")
+    parser.add_option("-j", "--gzip2", dest="comp", action="store_const",
+            const="bzip2",
+            help="Use bzip2 compression")
+    parser.add_option("-p", "--plain", dest="comp", action="store_const",
+            const="none",
+            help="Don't use compression")
+    parser.add_option("-d", "--debug", dest="verbosity", action="store_const",
+            const=logging.DEBUG, default=logging.WARNING,
+            help="Print debug output")
+    parser.add_option("-v", "--verbose", dest="verbosity", action="store_const",
+            const=logging.INFO,
+            help="Print verbose output")
+    parser.add_option("-q", "--quiet", dest="verbosity", action="store_const",
+            const=logging.ERROR,
+            help="Be silent!")
+    parser.add_option("", "--profile", dest="profile", action="store_true",
+            default=False,
+            help="Profile splittar")
+
+    options, args = parser.parse_args()
+    if options.output is None:
+        parser.error("-f/--output is required")
+    if len(args) == 0:
+        parser.error("at least one file/directory to archive is required")
+
+    # Set up logger
+    logging.basicConfig(level=options.verbosity, format="splittar: %(message)s")
+
+    if options.comp == "auto":
+        if options.output.endswith(".gz") or options.output.endswith(".tgz"):
+            options.comp = "gzip"
+        elif options.output.endswith(".bz2"):
+            options.comp = "bzip2"
+        else:
+            options.comp = "none"
+
+    tarargs = (options.output, options.maxsize, options.comp,
+            options.maxopen, options.ratioWeight, args)
+    if options.profile:
+        import hotshot
+        logging.info("Enabling profiling")
+        p = hotshot.Profile("splittar.prof")
+        retval = p.runcall(runTar, *tarargs)
+    else:
+        retval = runTar(*tarargs)
+    sys.exit(retval)
+
